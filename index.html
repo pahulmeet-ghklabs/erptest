@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src https://script.google.com https://script.googleusercontent.com; frame-src 'self' blob: about:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow">
+<title>School ERP</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="login" class="hide">
+  <div class="card login-card">
+    <div class="logo">S</div>
+    <h1 id="loginTitle">School ERP</h1>
+    <p class="muted" id="loginSub">Sign in to continue</p>
+    <form id="loginForm" autocomplete="on" class="grid" style="gap:12px">
+      <label class="f"><span data-t="username">Username</span><input id="lu" name="username" autocomplete="username" autocapitalize="off" required></label>
+      <label class="f"><span data-t="password">Password</span><input id="lp" name="password" type="password" autocomplete="current-password" required></label>
+      <div id="loginErr" class="alert bad hide"></div>
+      <button class="btn pri" id="loginBtn" style="justify-content:center;padding:11px"><span data-t="signin">Sign in</span></button>
+    </form>
+    <div class="row between mt"><button class="btn sm" id="langL" type="button">ਪੰਜਾਬੀ / English</button><span class="muted sm">Protected system · activity is logged</span></div>
+  </div>
+</div>
+<div id="app" class="hide">
+  <aside id="side"></aside>
+  <main>
+    <div class="top">
+      <button class="btn" id="menuBtn" aria-label="Menu">☰</button>
+      <h1 id="pageTitle"></h1><div class="grow"></div>
+      <button class="btn sm" id="langBtn" type="button">ਪੰਜਾਬੀ / EN</button>
+      <button class="btn sm" id="themeBtn" type="button" aria-label="Toggle theme">◐</button>
+      <div class="who"><div class="avatar" id="avatar"></div><div class="sm"><div class="b" id="uname"></div><div class="muted" id="urole"></div></div>
+      <button class="btn sm" id="logoutBtn" data-t="signout">Sign out</button></div>
+    </div>
+    <div id="view"></div>
+  </main>
+</div>
+<div id="modalRoot"></div>
+<div id="toasts" aria-live="polite"></div>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
