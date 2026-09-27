@@ -28,6 +28,7 @@ const money = n => nf.format(+n || 0);
 const cm = n => cur() + ' ' + money(n);
 const today = () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
 const can = p => !!(S.user && S.user.perms.indexOf(p) >= 0);
+const canNav = p => Array.isArray(p) ? p.some(can) : can(p);
 const byId = (list, id) => (list || []).find(x => String(x.id) === String(id));
 const cn = id => { const c = byId(S.boot.classes, id); return c ? c.name : ''; };
 const sn = id => { const c = byId(S.boot.sections, id); return c ? c.name : ''; };
@@ -87,6 +88,89 @@ function askText(title, label, def, required) {
   });
 }
 
+/* ---------------- files, camera & attachments ---------------- */
+const MAX_UPLOAD = 6 * 1024 * 1024;
+function blobUrl(b64, mime) { const bin = atob(b64), a = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return URL.createObjectURL(new Blob([a], { type: mime })); }
+function readAsB64(file) { return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1] || ''); r.onerror = () => rej(new Error('Could not read the file.')); r.readAsDataURL(file); }); }
+/* Shrinks a photo in the browser so uploads are fast on mobile data: longest side <= maxDim, JPEG quality q. PDFs pass through unchanged. */
+async function prepFile(file, maxDim, q) {
+  if (file.type === 'application/pdf') { if (file.size > MAX_UPLOAD) throw new Error('PDF is larger than 6 MB.'); return { name: file.name, mime: 'application/pdf', data: await readAsB64(file), size: file.size }; }
+  if (!/^image\/(jpeg|png|webp)$/.test(file.type)) throw new Error('Only photos (JPG/PNG/WebP) or PDF files can be attached.');
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('Could not open this image.')); i.src = url; });
+    const k = Math.min(1, (maxDim || 1600) / Math.max(img.naturalWidth, img.naturalHeight)), w = Math.max(1, Math.round(img.naturalWidth * k)), h = Math.max(1, Math.round(img.naturalHeight * k));
+    const c = document.createElement('canvas'); c.width = w; c.height = h; const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, w, h); x.drawImage(img, 0, 0, w, h);
+    const data = c.toDataURL('image/jpeg', q || 0.82).split(',')[1];
+    return { name: (file.name || 'photo').replace(/\.\w+$/, '') + '.jpg', mime: 'image/jpeg', data, size: Math.round(data.length * 0.75) };
+  } finally { URL.revokeObjectURL(url); }
+}
+/* Opens a Drive file (bill, receipt PDF, photo) inside the app. Staff never need Drive access: the server checks their permission and streams the file. */
+async function openFile(fileId, title) {
+  let url = '';
+  const m = modal({ title: title || 'File', size: 'wide', body: spinner, footer: '<button class="btn" data-close>Close</button><button class="btn" id="fvDl">Download</button><button class="btn pri" id="fvPr">Print</button>', onClose: () => { if (url) URL.revokeObjectURL(url); } });
+  try {
+    const f = await api('fileData', { fileId }); url = blobUrl(f.data, f.mime);
+    $('.body', m.el).innerHTML = f.mime === 'application/pdf' ? '<iframe title="File" id="fvf" src="' + url + '" style="width:100%;height:70vh;border:1px solid var(--line);border-radius:8px;background:#fff"></iframe>' : '<div class="c"><img id="fvi" alt="' + e(f.name) + '" src="' + url + '" style="max-width:100%;max-height:70vh;border-radius:8px"></div>';
+    $('#fvDl', m.el).onclick = () => { const a = document.createElement('a'); a.href = url; a.download = f.name; document.body.appendChild(a); a.click(); a.remove(); };
+    $('#fvPr', m.el).onclick = () => { const fr = $('#fvf', m.el); if (fr) fr.contentWindow.print(); else { const w = window.open(url); if (w) w.onload = () => w.print(); } };
+  } catch (x) { $('.body', m.el).innerHTML = '<div class="alert bad">' + e(x.message) + '</div>'; }
+}
+async function loadImg(img, fileId) { try { const f = await api('fileData', { fileId }); img.src = 'data:' + f.mime + ';base64,' + f.data; img.classList.remove('hide'); } catch (x) { /* thumbnail only */ } }
+/* Live camera capture with a file/gallery fallback (used when the camera is blocked or the browser has none). Resolves {name,mime,data,size,preview} or null. */
+function capturePhoto(o) {
+  o = o || {};
+  return new Promise(res => {
+    let stream = null, facing = o.facing || 'environment', done = false;
+    const stop = () => { if (stream) { stream.getTracks().forEach(t_ => t_.stop()); stream = null; } };
+    const finish = v_ => { if (done) return; done = true; stop(); m.el.remove(); res(v_); };
+    const m = modal({ title: o.title || 'Take a photo', size: 'wide', locked: true, body: '<div class="cam"><video id="camV" autoplay playsinline muted></video><div id="camMsg" class="muted sm c"></div></div><input type="file" id="camF" accept="image/*" capture="' + (facing === 'user' ? 'user' : 'environment') + '" class="hide">',
+      footer: '<button class="btn" id="camX">Cancel</button><button class="btn" id="camFile">Choose / take with phone camera…</button><button class="btn" id="camFlip">Switch camera</button><button class="btn pri" id="camSnap">📷 Capture</button>' });
+    const vid = $('#camV', m.el), msg = $('#camMsg', m.el);
+    const fromFile = async f => { try { const p = await prepFile(f, o.maxDim || 1600, o.quality || 0.82); p.preview = 'data:' + p.mime + ';base64,' + p.data; finish(p); } catch (x) { toast(x.message, 'bad'); } };
+    const start = async () => {
+      stop();
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { msg.textContent = 'Live camera is not available in this browser. Use “Choose / take with phone camera”.'; $('#camSnap', m.el).disabled = true; $('#camFlip', m.el).disabled = true; return; }
+      try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false }); vid.srcObject = stream; msg.textContent = ''; $('#camSnap', m.el).disabled = false; }
+      catch (x) { msg.textContent = 'Camera could not be opened (' + (x.name || 'error') + '). Allow camera access for this site, or use “Choose / take with phone camera”.'; $('#camSnap', m.el).disabled = true; }
+    };
+    $('#camX', m.el).onclick = () => finish(null);
+    $('#camFlip', m.el).onclick = () => { facing = facing === 'environment' ? 'user' : 'environment'; start(); };
+    $('#camFile', m.el).onclick = () => $('#camF', m.el).click();
+    $('#camF', m.el).onchange = ev => { if (ev.target.files[0]) fromFile(ev.target.files[0]); };
+    $('#camSnap', m.el).onclick = () => {
+      if (!vid.videoWidth) { toast('Camera is still starting – try again.', 'bad'); return; }
+      const c = document.createElement('canvas'); c.width = vid.videoWidth; c.height = vid.videoHeight; c.getContext('2d').drawImage(vid, 0, 0);
+      c.toBlob(b => { if (!b) { toast('Capture failed.', 'bad'); return; } fromFile(new File([b], (o.name || 'photo') + '.jpg', { type: 'image/jpeg' })); }, 'image/jpeg', 0.95);
+    };
+    start();
+  });
+}
+/* Attachment picker (bill / invoice photos): shows thumbnails, lets the user take photos, choose files, and remove them. Existing server-side files are listed with View / remove. */
+function attachBox(host, o) {
+  o = o || {}; const st = { files: [], keep: (o.existing || []).slice(), removed: [] };
+  const draw = () => {
+    host.innerHTML = '<div class="att">' + st.keep.map(f => '<div class="att-i"><div class="att-t" data-view="' + e(f.fileId) + '">' + (/pdf/.test(f.mime) ? '<span>PDF</span>' : '<span>🖼</span>') + '</div><div class="sm">' + e(f.name.replace(/^VOUCHER_ATT_[^_]*_?/, '').slice(0, 22)) + '</div><div class="row" style="gap:4px"><button type="button" class="btn sm" data-view="' + e(f.fileId) + '">View</button>' + (o.canRemove ? '<button type="button" class="btn sm bad" data-drop="' + e(f.fileId) + '">✕</button>' : '') + '</div></div>').join('') +
+      st.files.map((f, i) => '<div class="att-i"><div class="att-t">' + (f.mime === 'application/pdf' ? '<span>PDF</span>' : '<img alt="" src="data:' + f.mime + ';base64,' + f.data + '">') + '</div><div class="sm">' + e(f.name.slice(0, 22)) + ' · ' + Math.round(f.size / 1024) + ' KB</div><button type="button" class="btn sm bad" data-rmnew="' + i + '">Remove</button></div>').join('') + '</div>' +
+      '<div class="row mt"><button type="button" class="btn sm" data-cam>📷 Take photo</button><button type="button" class="btn sm" data-pick>＋ Choose file / photo</button><input type="file" class="hide" data-fi accept="image/*,application/pdf" multiple></div>';
+  };
+  host.addEventListener('click', async ev => {
+    const b = ev.target.closest('button,[data-view]'); if (!b) return;
+    if (b.dataset.view) { openFile(b.dataset.view, 'Attachment'); return; }
+    if (b.dataset.drop) { st.removed.push(b.dataset.drop); st.keep = st.keep.filter(f => f.fileId !== b.dataset.drop); draw(); return; }
+    if (b.dataset.rmnew !== undefined) { st.files.splice(+b.dataset.rmnew, 1); draw(); return; }
+    if (b.hasAttribute('data-cam')) { const p = await capturePhoto({ title: 'Photograph the bill / invoice', name: 'bill' }); if (p) { st.files.push(p); draw(); } return; }
+    if (b.hasAttribute('data-pick')) $('[data-fi]', host).click();
+  });
+  host.addEventListener('change', async ev => {
+    if (!ev.target.matches('[data-fi]')) return;
+    for (const f of Array.from(ev.target.files)) { try { st.files.push(await prepFile(f, 1600, 0.82)); } catch (x) { toast(f.name + ': ' + x.message, 'bad'); } }
+    draw();
+  });
+  draw();
+  return { newFiles: () => st.files.map(f => ({ name: f.name, mime: f.mime, data: f.data })), removed: () => st.removed.slice(), count: () => st.files.length + st.keep.length };
+}
+
 /* ---------------- api & session ---------------- */
 async function api(action, payload) {
   if (!CFG.API_URL) throw new Error('API_URL is not set in config.js');
@@ -126,7 +210,7 @@ async function enter() {
   document.title = (S.boot.settings.schoolName || 'School ERP');
   $('#uname').textContent = S.user.name; $('#urole').textContent = S.user.role; $('#avatar').textContent = (S.user.name || '?').charAt(0).toUpperCase();
   buildNav(); resetIdle();
-  const h = (location.hash || '').replace('#', '') || 'dashboard'; go(NAV.some(n => n.id === h && can(n.perm)) ? h : firstAllowed());
+  const h = (location.hash || '').replace('#', '') || 'dashboard'; go(NAV.some(n => n.id === h && canNav(n.perm)) ? h : firstAllowed());
 }
 function forcePasswordChange() {
   if ($('#pwModal')) return;
@@ -143,21 +227,21 @@ function forcePasswordChange() {
 
 /* ---------------- navigation ---------------- */
 const NAV = [
-  { id: 'dashboard', ic: '▦', perm: 'students.view', sec: 'main' }, { id: 'students', ic: '☺', perm: 'students.view' }, { id: 'fees', ic: '₹', perm: 'fees.receive' }, { id: 'receipts', ic: '▤', perm: 'fees.receive' },
+  { id: 'dashboard', ic: '▦', perm: ['fees.receive', 'reports.view'], sec: 'main' }, { id: 'students', ic: '☺', perm: 'students.view' }, { id: 'fees', ic: '₹', perm: 'fees.receive' }, { id: 'receipts', ic: '▤', perm: 'fees.receive' },
   { id: 'adjust', ic: '±', perm: 'fees.adjust', sec: 'tools' }, { id: 'reports', ic: '▥', perm: 'reports.view' }, { id: 'yearend', ic: '⇪', perm: 'students.edit' },
   { id: 'setup', ic: '⚙', perm: 'masters.edit', sec: 'admin' }, { id: 'users', ic: '⚿', perm: 'users.manage' }, { id: 'settings', ic: '✎', perm: 'settings.edit' }, { id: 'audit', ic: '☰', perm: 'audit.view' }
 ];
-const firstAllowed = () => (NAV.find(n => can(n.perm)) || NAV[0]).id;
+const firstAllowed = () => (NAV.find(n => n.id === 'dashboard' && canNav(n.perm)) || NAV.find(n => n.id === 'gate' && canNav(n.perm)) || NAV.find(n => canNav(n.perm)) || NAV[0]).id;
 function buildNav() {
   let h = '<div class="brand"><div class="logo">' + e((S.boot.settings.schoolName || 'S').charAt(0)) + '</div><div><b>' + e(S.boot.settings.schoolName) + '</b><span>School management</span></div></div><nav class="nav">';
-  NAV.filter(n => can(n.perm)).forEach(n => { if (n.sec) h += '<div class="sec">' + e(t(n.sec)) + '</div>'; h += '<a data-go="' + n.id + '" tabindex="0"><span class="ic">' + n.ic + '</span>' + e(t(n.id)) + '</a>'; });
+  NAV.filter(n => canNav(n.perm)).forEach(n => { if (n.sec) h += '<div class="sec">' + e(t(n.sec)) + '</div>'; h += '<a data-go="' + n.id + '" tabindex="0"><span class="ic">' + n.ic + '</span>' + e(t(n.id)) + '</a>'; });
   h += '</nav><div class="grow"></div><a class="btn sm" id="chLang" style="justify-content:center;margin-bottom:6px">ਪੰਜਾਬੀ / English</a><a class="btn sm" id="chPw" style="justify-content:center">Change password</a>';
   $('#side').innerHTML = h;
 }
 const VIEWS = {};
 async function go(id, arg) {
   if (!S.user) return;
-  const n = NAV.find(x => x.id === id); if (!n || !can(n.perm)) { toast('You do not have access to that page.', 'bad'); return; }
+  const n = NAV.find(x => x.id === id); if (!n || !canNav(n.perm)) { toast('You do not have access to that page.', 'bad'); return; }
   S.route = id; if (location.hash !== '#' + id) history.replaceState(null, '', '#' + id);
   $$('.nav a').forEach(a => a.classList.toggle('on', a.dataset.go === id));
   $('#pageTitle').textContent = t(id); $('#side').classList.remove('open');
@@ -194,7 +278,7 @@ VIEWS.students = async () => {
     const r = await api('studentSearch', { q: ST.q, classId: ST.classId, sectionId: ST.sectionId, status: ST.status, limit: 300 });
     $('#stList').innerHTML = '<div class="muted sm mb">' + r.total + ' student' + (r.total === 1 ? '' : 's') + (r.total > r.rows.length ? ' (showing first ' + r.rows.length + ' – refine your search)' : '') + '</div>' +
       table([{ l: 'Adm. No', k: 'admNo' }, { l: 'Student', h: s => '<b>' + e(s.name) + '</b>' + (s.left ? ' ' + pill('Left', 'bad') : '') }, { l: 'Class', f: s => cn(s.classId) + (s.sectionId ? '-' + sn(s.sectionId) : '') }, { l: 'Roll', k: 'rollNo' }, { l: 'Father', k: 'fatherName' }, { l: 'Mobile', k: 'mobile' },
-        { l: '', h: s => '<div class="row" style="flex-wrap:nowrap">' + (can('fees.receive') && !s.left ? '<button class="btn sm" data-act="collect" data-id="' + e(s.admNo) + '">Collect</button>' : '') + '<button class="btn sm" data-act="ledger" data-id="' + e(s.admNo) + '">Ledger</button>' + (can('students.edit') ? '<button class="btn sm" data-act="editst" data-id="' + e(s.admNo) + '">Edit</button>' : '') + '</div>' }], r.rows, { empty: 'No students match.' });
+        { l: '', h: s => '<div class="row" style="flex-wrap:nowrap">' + (can('fees.receive') && !s.left ? '<button class="btn sm" data-act="collect" data-id="' + e(s.admNo) + '">Collect</button>' : '') + (can('fees.receive') || can('reports.view') ? '<button class="btn sm" data-act="ledger" data-id="' + e(s.admNo) + '">Ledger</button>' : '') + (can('students.edit') ? '<button class="btn sm" data-act="editst" data-id="' + e(s.admNo) + '">Edit</button>' : '') + '</div>' }], r.rows, { empty: 'No students match.' });
   };
   const dl = debounce(() => run(null, load), 300);
   $('#sq').oninput = dl; ['sc', 'ss', 'sst'].forEach(i => $('#' + i).onchange = () => run(null, load));
@@ -207,14 +291,14 @@ async function studentForm(admNo) {
   const parse = x => { try { return typeof x === 'string' ? JSON.parse(x || '[]') : (x || []); } catch (z) { return []; } };
   const nonRes = B.feeTypes.filter(f => f.id !== 'ft_opening' && f.id !== 'ft_transport');
   const rowsHtml = (list, cls) => list.map(o => feeRow(cls, o)).join('');
-  function feeRow(cls, o) { return '<div class="row ' + cls + '" style="flex-wrap:nowrap"><select style="flex:2">' + opt(nonRes, 'id', 'name', o.feeTypeId, 'Select fee') + '</select><input type="number" min="0" step="0.01" style="flex:1" placeholder="Amount" value="' + e(o.amount || '') + '"><button type="button" class="btn sm" data-rm>✕</button></div>'; }
+  function feeRow(cls, o) { return '<div class="row ' + cls + '" style="flex-wrap:nowrap"><select style="flex:2">' + opt(nonRes, 'id', 'name', o.feeTypeId, 'Select fee') + '</select>' + (cls === 'con' ? '<select class="cm" style="flex:0 0 84px" title="Fixed amount or percentage"><option value="FIXED"' + (o.mode !== 'PCT' ? ' selected' : '') + '>₹ off</option><option value="PCT"' + (o.mode === 'PCT' ? ' selected' : '') + '>% off</option></select>' : '') + '<input type="number" min="0" step="0.01" style="flex:1" placeholder="' + (cls === 'con' ? 'Amount or %' : 'Amount') + '" value="' + e(o.amount || '') + '"><button type="button" class="btn sm" data-rm>✕</button></div>'; }
   const tabs = ['Basic', 'Parents & contact', 'Fee setup', 'Other'];
   const body = '<div class="tabs">' + tabs.map((x, i) => '<button type="button" data-tab="' + i + '" class="' + (i ? '' : 'on') + '">' + x + '</button>').join('') + '</div>' +
     '<div data-pane="0" class="form">' + fld('Admission no. ' + (admNo ? '' : '(auto if blank)'), inp('f_admNo', s.admNo || '', admNo ? 'readonly' : 'inputmode="numeric"')) + fld('Admission date', inp('f_admDate', s.admDate, 'type="date"')) +
     fld('Student name *', inp('f_name', s.name || '', 'maxlength="80"'), 'full') +
     fld('Gender *', '<select id="f_gender">' + opt([{ id: 'Male' }, { id: 'Female' }, { id: 'Other' }], 'id', 'id', s.gender, 'Select') + '</select>') + fld('Date of birth', inp('f_dob', s.dob || '', 'type="date"')) +
     fld('Class *', '<select id="f_classId">' + opt(B.classes, 'id', 'name', s.classId, 'Select') + '</select>') + fld('Section', '<select id="f_sectionId">' + opt(B.sections, 'id', 'name', s.sectionId, '—') + '</select>') +
-    fld('Roll no.', inp('f_rollNo', s.rollNo || '')) + fld('Category', '<select id="f_categoryId">' + opt(B.categories, 'id', 'name', s.categoryId, '—') + '</select>') + fld('Religion', inp('f_religion', s.religion || '')) + fld('Registration no.', inp('f_regNo', s.regNo || '')) + '</div>' +
+    (admNo && can('gate.issue') ? '<div class="full row" style="align-items:center"><img id="stPh" class="ph-sm hide" alt="Student photo"><button type="button" class="btn sm" id="stPhBtn">📷 ' + (s.photoFileId ? 'Retake student photo' : 'Add student photo') + '</button><span class="muted sm">Used on gate passes.</span></div>' : '') + fld('Roll no.', inp('f_rollNo', s.rollNo || '')) + fld('Category', '<select id="f_categoryId">' + opt(B.categories, 'id', 'name', s.categoryId, '—') + '</select>') + fld('Religion', inp('f_religion', s.religion || '')) + fld('Registration no.', inp('f_regNo', s.regNo || '')) + '</div>' +
     '<div data-pane="1" class="form hide">' + fld('Father name *', inp('f_fatherName', s.fatherName || ''), 'full') + fld('Mother name', inp('f_motherName', s.motherName || ''), 'full') + fld('Mobile', inp('f_mobile', s.mobile || '', 'inputmode="tel"')) + fld('Alternate mobile', inp('f_altMobile', s.altMobile || '', 'inputmode="tel"')) +
     fld('Parent email (for receipts)', inp('f_email', s.email || '', 'type="email"'), 'full') + fld('Address', '<textarea id="f_address">' + e(s.address || '') + '</textarea>', 'full') + fld('City', inp('f_city', s.city || '')) + fld('State', inp('f_state', s.state || '')) + fld('PIN code', inp('f_pincode', s.pincode || '')) + fld('Guardian name', inp('f_guardianName', s.guardianName || '')) + fld('Siblings (adm. nos, comma separated)', inp('f_siblings', s.siblings || ''), 'full') + '</div>' +
     '<div data-pane="2" class="hide"><div class="form">' + fld('Student type', '<select id="f_studentType"><option value="New"' + (s.studentType === 'New' ? ' selected' : '') + '>New admission</option><option value="Existing"' + (s.studentType === 'Existing' ? ' selected' : '') + '>Existing student</option></select>') +
@@ -222,7 +306,7 @@ async function studentForm(admNo) {
     fld('Transport stop', '<select id="f_routeId">' + opt(B.routes, 'id', r => (r.mainRoute ? r.mainRoute + ' → ' : '') + r.stopName + ' (' + money(r.amount) + ')', s.routeId, 'No transport') + '</select>') +
     fld('Opening balance (previous dues)', inp('f_openingBalance', s.openingBalance || 0, 'type="number" step="0.01"')) + '</div>' +
     '<h3 class="mt">Other applicable fees <span class="muted sm">(fee types marked “not planned”)</span></h3><div id="othBox" class="grid" style="gap:8px;margin:8px 0">' + rowsHtml(parse(s.otherFees), 'oth') + '</div><button type="button" class="btn sm" id="addOth">+ Add fee</button>' +
-    '<h3 class="mt">Special concession <span class="muted sm">(applied to every period for periodic fees)</span></h3><div id="conBox" class="grid" style="gap:8px;margin:8px 0">' + rowsHtml(parse(s.specialConcession), 'con') + '</div><button type="button" class="btn sm" id="addCon">+ Add concession</button>' +
+    '<h3 class="mt">Subsidy / special concession <span class="muted sm">(not everyone pays the same – a fixed ₹ amount or a % is taken off each period for periodic fees, once for annual fees)</span></h3><div id="conBox" class="grid" style="gap:8px;margin:8px 0">' + rowsHtml(parse(s.specialConcession), 'con') + '</div><button type="button" class="btn sm" id="addCon">+ Add subsidy</button><div class="form mt">' + fld('Reason for subsidy (shown in concession register)', inp('f_subsidyReason', s.subsidyReason || '', 'maxlength="150" placeholder="e.g. Single parent, staff child, scholarship"'), 'full') + '</div>' +
     '<hr>' + chk('f_impose', admNo ? 'Re-apply fee structure to this student’s ledger now (replaces structure-generated dues; receipts are kept)' : 'Apply fee structure to ledger on save', !admNo) + '<div class="row mt"><button type="button" class="btn sm" id="prevFee">Preview fee structure</button></div><div id="feePrev"></div></div>' +
     '<div data-pane="3" class="form hide">' + (admNo ? chk('f_left', 'Student has left the school', s.left === true || String(s.left).toLowerCase() === 'true') + fld('Left on', inp('f_leftDate', s.leftDate || '', 'type="date"')) : '') + fld('Remarks', '<textarea id="f_remarks">' + e(s.remarks || '') + '</textarea>', 'full') + '</div>';
   const m = modal({ title: admNo ? 'Edit student #' + admNo : 'New admission', size: 'wide', body, footer: '<button class="btn" data-close>Cancel</button><button class="btn pri" id="saveSt">Save student</button>' });
@@ -233,11 +317,13 @@ async function studentForm(admNo) {
     if (ev.target.id === 'addCon') $('#conBox', m.el).insertAdjacentHTML('beforeend', feeRow('con', {}));
   });
   const collect = () => {
-    const o = {}; ['admNo', 'admDate', 'name', 'gender', 'dob', 'classId', 'sectionId', 'rollNo', 'categoryId', 'religion', 'regNo', 'fatherName', 'motherName', 'mobile', 'altMobile', 'email', 'address', 'city', 'state', 'pincode', 'guardianName', 'siblings', 'studentType', 'feeCategoryId', 'routeId', 'openingBalance', 'remarks'].forEach(k => { o[k] = v('f_' + k); });
+    const o = {}; ['admNo', 'admDate', 'name', 'gender', 'dob', 'classId', 'sectionId', 'rollNo', 'categoryId', 'religion', 'regNo', 'fatherName', 'motherName', 'mobile', 'altMobile', 'email', 'address', 'city', 'state', 'pincode', 'guardianName', 'siblings', 'studentType', 'feeCategoryId', 'routeId', 'openingBalance', 'remarks', 'subsidyReason'].forEach(k => { o[k] = v('f_' + k); });
     if (admNo) { o.left = v('f_left'); o.leftDate = v('f_leftDate'); }
-    const rows = cls => $$('.' + cls, m.el).map(r => ({ feeTypeId: $('select', r).value, amount: parseFloat($('input', r).value) || 0 })).filter(x => x.feeTypeId && x.amount > 0);
+    const rows = cls => $$('.' + cls, m.el).map(r => { const o2 = { feeTypeId: $('select', r).value, amount: parseFloat($('input', r).value) || 0 }; if (cls === 'con') { o2.mode = $('.cm', r).value; if (o2.mode === 'PCT' && o2.amount > 100) o2.amount = 100; } return o2; }).filter(x => x.feeTypeId && x.amount > 0);
     o.otherFees = rows('oth'); o.specialConcession = rows('con'); return o;
   };
+  if (admNo && s.photoFileId && $('#stPh', m.el)) loadImg($('#stPh', m.el), s.photoFileId);
+  const pb = $('#stPhBtn', m.el); if (pb) pb.onclick = () => run(pb, async () => { const p = await capturePhoto({ title: 'Photo of ' + s.name, facing: 'user', maxDim: 720, quality: 0.85, name: 'student' }); if (!p) return; const r = await api('studentPhotoSave', { admNo, photo: { name: p.name, mime: p.mime, data: p.data } }); s.photoFileId = r.fileId; $('#stPh', m.el).src = p.preview; $('#stPh', m.el).classList.remove('hide'); toast('Photo saved.', 'ok'); });
   $('#prevFee', m.el).onclick = ev => run(ev.target, async () => {
     const o = collect(); if (!o.classId || !o.feeCategoryId) throw new Error('Choose class and fee category first.');
     const list = await api('feePreview', { student: o });
@@ -272,10 +358,10 @@ function autocomplete(box, onPick) {
   list.onclick = ev => { const it = ev.target.closest('.item'); if (it) onPick(items[+it.dataset.i]); };
 }
 VIEWS.fees = async arg => {
-  FE = { student: null, detail: null, amt: {}, date: today(), mode: 'Cash', bankRef: '', remarks: '', emailTo: '', edit: null, waive: 0, waiveReason: '', sendEmail: null };
+  FE = { student: null, detail: null, amt: {}, wv: {}, acct: '', date: today(), mode: 'Cash', bankRef: '', remarks: '', emailTo: '', edit: null, waive: 0, waiveReason: '', sendEmail: null };
   if (arg && arg.edit) {
     const r = await api('receiptGet', { receiptNo: arg.edit }); const rc = r.receipt;
-    Object.assign(FE, { edit: rc.receiptNo, date: rc.date, mode: rc.mode, bankRef: rc.bankRef, remarks: rc.remarks, emailTo: rc.emailTo, preLines: r.lines.filter(l => l.feeTypeId !== 'LATE'), waive: +rc.lateWaived || 0 });
+    Object.assign(FE, { edit: rc.receiptNo, date: rc.date, mode: rc.mode, bankRef: rc.bankRef, remarks: rc.remarks, emailTo: rc.emailTo, preLines: r.lines.filter(l => l.feeTypeId !== 'LATE'), waive: +rc.lateWaived || 0, acct: rc.accountId || '', waiveReason: rc.waiveReason || '' });
     await loadFeeStudent(rc.admNo);
   } else if (arg && arg.admNo) await loadFeeStudent(arg.admNo);
   drawFees();
@@ -284,17 +370,23 @@ async function loadFeeStudent(admNo) {
   const d = await api('feeDetail', { admNo, date: FE.date, excludeReceipt: FE.edit || '' });
   FE.detail = d; FE.student = d.student; if (!FE.emailTo) FE.emailTo = d.student.email || '';
   if (FE.sendEmail === null) FE.sendEmail = S.boot.settings.emailAuto === 'true' && emailOk(FE.emailTo);
-  if (FE.preLines) { FE.amt = {}; FE.preLines.forEach(l => { FE.amt[l.periodId + '|' + l.feeTypeId] = (FE.amt[l.periodId + '|' + l.feeTypeId] || 0) + (+l.amount); }); FE.preLines = null; }
-  else { FE.amt = {}; d.periods.forEach(p => { if (p.periodId === 'OPEN' || (p.lastDate && p.lastDate <= FE.date)) p.lines.forEach(l => { FE.amt[p.periodId + '|' + l.feeTypeId] = l.due; }); }); }
+  if (FE.preLines) { FE.amt = {}; FE.wv = {}; FE.preLines.forEach(l => { const k = l.periodId + '|' + l.feeTypeId; FE.amt[k] = (FE.amt[k] || 0) + (+l.amount); if (+l.waived) FE.wv[k] = (FE.wv[k] || 0) + (+l.waived); }); FE.preLines = null; }
+  else { FE.amt = {}; FE.wv = {}; d.periods.forEach(p => { if (p.periodId === 'OPEN' || (p.lastDate && p.lastDate <= FE.date)) p.lines.forEach(l => { FE.amt[p.periodId + '|' + l.feeTypeId] = l.due; }); }); }
 }
 function feeTotals() {
   let fee = 0, late = 0;
   FE.detail.periods.forEach(p => { let any = false; p.lines.forEach(l => { const a = +FE.amt[p.periodId + '|' + l.feeTypeId] || 0; fee += a; if (a > 0) any = true; }); if (any) late += p.late || 0; });
-  const w = Math.min(+FE.waive || 0, late); return { fee, late, w, total: Math.round((fee + late - w) * 100) / 100 };
+  const w = Math.min(+FE.waive || 0, late); let lw = 0; Object.keys(FE.wv).forEach(k => { lw += +FE.wv[k] || 0; }); return { fee, late, w, lw, total: Math.round((fee + late - w) * 100) / 100 };
 }
 function updateFeeTotals() {
-  const x = feeTotals(); $('#tFee').textContent = cm(x.fee); $('#tLate').textContent = cm(x.late - x.w); $('#tTot').textContent = cm(x.total);
-  FE.detail.periods.forEach(p => { const el = document.getElementById('ps_' + p.periodId); if (!el) return; let s = 0, all = true; p.lines.forEach(l => { const a = +FE.amt[p.periodId + '|' + l.feeTypeId] || 0; s += a; if (Math.abs(a - l.due) > 0.004) all = false; }); el.textContent = cm(s); const cb = document.getElementById('pc_' + p.periodId); if (cb) cb.checked = all; });
+  const x = feeTotals(); $('#tFee').textContent = cm(x.fee); $('#tLate').textContent = cm(x.late - x.w); $('#tTot').textContent = cm(x.total); const tw = $('#tWv'); if (tw) { tw.textContent = cm(x.lw + x.w); tw.parentElement.classList.toggle('hide', !(x.lw + x.w)); }
+  FE.detail.periods.forEach(p => { const el = document.getElementById('ps_' + p.periodId); if (!el) return; let s = 0, all = true; p.lines.forEach(l => { const k = p.periodId + '|' + l.feeTypeId, a = +FE.amt[k] || 0; s += a; if (Math.abs(a - l.due) > 0.004) all = false; }); el.textContent = cm(s); const cb = document.getElementById('pc_' + p.periodId); if (cb) cb.checked = all; });
+}
+function acctOpts() {
+  const want = FE.mode === 'Cash' ? 'Cash' : 'Bank', list = (S.boot.cashBank || []).filter(a => a.kind === want);
+  if (!list.some(a => a.id === FE.acct)) FE.acct = (list.find(a => a.id === S.boot.settings.defaultBankId) || list[0] || {}).id || '';
+  if (FE.mode === 'Cash') FE.acct = (list[0] || {}).id || FE.acct;
+  return opt(list, 'id', a => a.name + (a.bankName ? ' – ' + a.bankName : ''), FE.acct);
 }
 function drawFees() {
   const view = $('#view');
@@ -302,38 +394,41 @@ function drawFees() {
     view.innerHTML = '<div class="card" style="max-width:640px;margin:40px auto"><h2>Collect fee</h2><p class="muted">Search by student name, admission no., father’s name or mobile.</p><div class="ac mt"><input id="feeSearch" placeholder="Start typing…" autocomplete="off"><div class="list hide"></div></div></div>';
     autocomplete($('.ac'), s => run(null, async () => { await loadFeeStudent(s.admNo); drawFees(); })); $('#feeSearch').focus(); return;
   }
-  const d = FE.detail, st = FE.student, B = S.boot, canWaive = can('fees.adjust');
+  const d = FE.detail, st = FE.student, B = S.boot, canWaive = can('fees.waive');
   view.innerHTML =
     (FE.edit ? '<div class="alert mb">Editing receipt <b>' + e(FE.edit) + '</b>. Saving will update the ledger, regenerate the PDF in Drive and (optionally) email the revised receipt. Every change is recorded in the audit log.</div>' : '') +
     '<div class="grid" style="grid-template-columns:minmax(0,1fr) 320px;align-items:start;gap:16px" id="feeGrid"><div class="card">' +
     '<div class="row between mb"><div><h2>' + e(st.name) + ' <span class="muted">#' + e(st.admNo) + '</span></h2><div class="muted">' + e(st.className) + (st.sectionName ? '-' + e(st.sectionName) : '') + ' · Father: ' + e(st.fatherName) + ' · ' + e(st.mobile) + '</div></div>' +
     (FE.edit ? '' : '<button class="btn sm" id="chgSt">Change student</button>') + '</div>' +
     '<div class="form mb">' + fld('Receipt date', inp('fdate', FE.date, 'type="date"')) + fld('Payment mode', '<select id="fmode">' + ['Cash', 'UPI', 'Bank', 'Cheque', 'Card'].map(m => '<option' + (FE.mode === m ? ' selected' : '') + '>' + m + '</option>').join('') + '</select>') +
-    fld('Reference / cheque / UTR no.', inp('fref', FE.bankRef, 'maxlength="60"'), FE.mode === 'Cash' ? 'hide' : '') + '</div>' +
+    fld('Reference / cheque / UTR no.', inp('fref', FE.bankRef, 'maxlength="60"'), FE.mode === 'Cash' ? 'hide' : '') + fld('Deposit to', '<select id="facct">' + acctOpts() + '</select>') + '</div>' +
     (d.periods.length ? '<div class="row between mb"><h3>Select periods & fee heads</h3><span class="muted sm">Tick a period to pay it in full, or type any part-payment amount.</span></div>' +
       d.periods.map(p => '<div class="period"><div class="ph"><input type="checkbox" id="pc_' + e(p.periodId) + '" data-pc="' + e(p.periodId) + '"> <b class="grow">' + e(p.name) + '</b>' + (p.lastDate && p.lastDate < FE.date ? pill('Overdue', 'bad') : '') + (p.lastDate ? '<span class="muted sm">due ' + e(p.lastDate) + '</span>' : '') + '<b id="ps_' + e(p.periodId) + '"></b></div>' +
-        p.lines.map(l => '<div class="ln"><span>' + e(l.name) + '</span><span class="muted r">due ' + money(l.due) + '</span><input type="number" step="0.01" min="0" max="' + l.due + '" data-amt="' + e(p.periodId + '|' + l.feeTypeId) + '" data-due="' + l.due + '" value="' + (FE.amt[p.periodId + '|' + l.feeTypeId] || '') + '" placeholder="0.00" aria-label="' + e(l.name) + '"></div>').join('') +
+        p.lines.map(l => '<div class="ln' + (canWaive ? ' w' : '') + '"><span>' + e(l.name) + '</span><span class="muted r">due ' + money(l.due) + '</span><input type="number" step="0.01" min="0" max="' + l.due + '" data-amt="' + e(p.periodId + '|' + l.feeTypeId) + '" data-due="' + l.due + '" value="' + (FE.amt[p.periodId + '|' + l.feeTypeId] || '') + '" placeholder="Pay" aria-label="' + e(l.name) + ' – amount to pay">' + (canWaive ? '<input type="number" step="0.01" min="0" max="' + l.due + '" data-wv="' + e(p.periodId + '|' + l.feeTypeId) + '" data-due="' + l.due + '" value="' + (FE.wv[p.periodId + '|' + l.feeTypeId] || '') + '" placeholder="Waive" title="Waive / subsidise part of this fee" class="wvin" aria-label="' + e(l.name) + ' – amount to waive">' : '') + '</div>').join('') +
         (p.late ? '<div class="ln"><span>Late fee (if this period is paid)</span><span></span><span class="r warn">' + money(p.late) + '</span></div>' : '') + '</div>').join('')
       : '<div class="empty">No pending dues for this student.</div>') +
     '<div class="form mt">' + fld('Remarks', inp('frem', FE.remarks, 'maxlength="200"'), 'full') + '</div>' +
-    '<div class="sticky-total"><div><div class="muted sm">Fee</div><b id="tFee"></b></div><div><div class="muted sm">Late fee</div><b id="tLate"></b></div><div><div class="muted sm">Total to receive</div><div class="tot-big" id="tTot"></div></div><div class="grow"></div>' +
+    '<div class="sticky-total"><div><div class="muted sm">Fee</div><b id="tFee"></b></div><div><div class="muted sm">Late fee</div><b id="tLate"></b></div><div class="hide"><div class="muted sm">Waived</div><b id="tWv" class="warn"></b></div><div><div class="muted sm">Total to receive</div><div class="tot-big" id="tTot"></div></div><div class="grow"></div>' +
     '<button class="btn" id="fClear">Reset</button><button class="btn pri" id="fSave" style="padding:11px 22px">' + (FE.edit ? 'Update receipt' : 'Save & issue receipt') + '</button></div></div>' +
     '<div class="grid" style="gap:16px"><div class="card"><div class="muted sm">Outstanding balance</div><div class="tot-big">' + cm(d.balance) + '</div><button class="btn sm mt" data-act="ledger" data-id="' + e(st.admNo) + '">View ledger</button></div>' +
-    (canWaive && d.periods.some(p => p.late) ? '<div class="card"><h3>Late fee waiver</h3><p class="muted sm">Approve a concession on the late fee (recorded in the ledger and audit log).</p>' + fld('Waive amount', inp('fwaive', FE.waive || '', 'type="number" min="0" step="0.01"')) + '<div style="height:8px"></div>' + fld('Reason', inp('fwr', FE.waiveReason)) + '</div>' : '') +
+    (canWaive ? '<div class="card"><h3>Waiver / subsidy</h3><p class="muted sm">Type an amount in the <b>Waive</b> box of any fee line to forgive part or all of it (not everyone pays the same). ' + (d.periods.some(p => p.late) ? 'You can also waive part of the late fee below. ' : '') + 'A reason is mandatory; it is printed on the receipt, kept in the concession register and the audit log.</p>' + (d.periods.some(p => p.late) ? fld('Late fee to waive', inp('fwaive', FE.waive || '', 'type="number" min="0" step="0.01"')) + '<div style="height:8px"></div>' : '') + fld('Reason for waiver *', inp('fwr', FE.waiveReason, 'maxlength="150" placeholder="e.g. Approved by principal – sibling discount"')) + (st.subsidyReason ? '<p class="muted sm mt">Student’s standing subsidy: ' + e(st.subsidyReason) + '</p>' : '') + '</div>' : '') +
     '<div class="card"><h3>Email receipt</h3><div class="grid mt" style="gap:10px">' + chk('fsend', 'Email PDF receipt to parent', FE.sendEmail) + fld('Send to', inp('fmail', FE.emailTo, 'type="email" placeholder="parent@example.com"')) + '<p class="muted sm">A PDF copy is always saved to your Drive folder.</p></div></div></div></div>';
   if (window.innerWidth < 1000) $('#feeGrid').style.gridTemplateColumns = '1fr';
   updateFeeTotals();
   const chg = $('#chgSt'); if (chg) chg.onclick = () => { FE.student = null; drawFees(); };
   $('#fdate').onchange = ev => run(null, async () => { FE.date = ev.target.value || today(); const keep = Object.assign({}, FE.amt); await loadFeeStudent(FE.student.admNo); FE.amt = keep; drawFees(); });
-  $('#fmode').onchange = ev => { FE.mode = ev.target.value; $('#fref').closest('label').classList.toggle('hide', FE.mode === 'Cash'); };
-  $('#fClear').onclick = () => { FE.amt = {}; FE.waive = 0; drawFees(); };
+  $('#fmode').onchange = ev => { FE.mode = ev.target.value; $('#fref').closest('label').classList.toggle('hide', FE.mode === 'Cash'); $('#facct').innerHTML = acctOpts(); };
+  $('#fClear').onclick = () => { FE.amt = {}; FE.wv = {}; FE.waive = 0; drawFees(); };
   $('#fSave').onclick = ev => run(ev.target, async () => {
     FE.bankRef = v('fref'); FE.remarks = v('frem'); FE.emailTo = v('fmail'); FE.sendEmail = v('fsend'); FE.waive = parseFloat(v('fwaive')) || 0; FE.waiveReason = v('fwr');
-    const lines = []; Object.keys(FE.amt).forEach(k => { const a = +FE.amt[k]; if (a > 0) { const p = k.split('|'); lines.push({ periodId: p[0], feeTypeId: p[1], amount: a }); } });
+    FE.acct = v('facct'); const lines = [], keys = {}; Object.keys(FE.amt).concat(Object.keys(FE.wv)).forEach(k => { keys[k] = 1; });
+    Object.keys(keys).forEach(k => { const a = +FE.amt[k] || 0, w = +FE.wv[k] || 0; if (a > 0 || w > 0) { const p = k.split('|'); lines.push({ periodId: p[0], feeTypeId: p[1], amount: a, waive: w }); } });
     if (!lines.length) throw new Error('Enter an amount to receive.');
+    const x0 = feeTotals(); if (!(x0.total > 0)) throw new Error('The amount actually received must be more than zero. To write off dues completely use Fee Adjustments → Concession.');
+    if ((x0.lw + x0.w) > 0 && FE.waiveReason.trim().length < 3) throw new Error('Enter the reason for the waiver / subsidy.');
     if (FE.sendEmail && !emailOk(FE.emailTo)) throw new Error('Enter a valid email address or untick “Email PDF receipt”.');
-    const x = feeTotals(); if (!(await ask((FE.edit ? 'Update receipt ' + FE.edit + ' to ' : 'Issue receipt for ') + cm(x.total) + ' (' + FE.mode + ') for ' + FE.student.name + '?', FE.edit ? 'Update' : 'Issue receipt'))) return;
-    const r = await api('receiptSave', { receiptNo: FE.edit || '', admNo: FE.student.admNo, date: FE.date, mode: FE.mode, bankRef: FE.bankRef, remarks: FE.remarks, lines, lateWaive: FE.waive, waiveReason: FE.waiveReason, sendEmail: FE.sendEmail, emailTo: FE.emailTo });
+    const x = feeTotals(); if (!(await ask((FE.edit ? 'Update receipt ' + FE.edit + ' to ' : 'Issue receipt for ') + cm(x.total) + ' (' + FE.mode + ')' + (x.lw + x.w ? ', with ' + cm(x.lw + x.w) + ' waived,' : '') + ' for ' + FE.student.name + '?', FE.edit ? 'Update' : 'Issue receipt'))) return;
+    const r = await api('receiptSave', { receiptNo: FE.edit || '', admNo: FE.student.admNo, date: FE.date, mode: FE.mode, bankRef: FE.bankRef, remarks: FE.remarks, lines, accountId: FE.acct, lateWaive: FE.waive, waiveReason: FE.waiveReason, sendEmail: FE.sendEmail, emailTo: FE.emailTo });
     receiptDone(r);
   });
 }
@@ -341,8 +436,9 @@ function receiptDone(r) {
   const em = r.emailStatus || '';
   const m = modal({ title: 'Receipt saved', size: 'sm', locked: true, body: '<div class="c"><div style="font-size:42px;color:var(--ok)">✓</div><h2>' + e(r.receiptNo) + '</h2><div class="tot-big">' + cm(r.total) + '</div></div><div class="grid mt" style="gap:8px">' +
     '<div class="alert ok">PDF saved to Drive.</div>' + (em === 'SENT' ? '<div class="alert ok">Emailed to parent.</div>' : em.indexOf('FAILED') === 0 ? '<div class="alert bad">Email not sent – ' + e(em.replace('FAILED: ', '')) + '. You can resend from Receipts.</div>' : '') + '</div>',
-    footer: '<button class="btn" id="dPrint">Print</button>' + (r.pdfUrl ? '<a class="btn" target="_blank" rel="noopener noreferrer" href="' + e(r.pdfUrl) + '">Open PDF</a>' : '') + '<button class="btn pri" id="dNew">Collect another</button>' });
+    footer: '<button class="btn" id="dPrint">Print</button>' + (r.pdfFileId ? '<button class="btn" id="dPdf">Open PDF</button>' : '') + '<button class="btn pri" id="dNew">Collect another</button>' });
   $('#dPrint', m.el).onclick = () => viewReceipt(r.receiptNo, true);
+  const dp = $('#dPdf', m.el); if (dp) dp.onclick = () => openFile(r.pdfFileId, 'Receipt ' + r.receiptNo);
   $('#dNew', m.el).onclick = () => { m.el.remove(); go('fees'); };
 }
 async function viewReceipt(no, autoPrint) {
@@ -365,9 +461,9 @@ VIEWS.receipts = async () => {
     RC.q = v('rq'); RC.from = v('rf'); RC.to = v('rt'); RC.status = v('rs');
     const r = await api('receiptList', { q: RC.q, from: RC.from, to: RC.to, status: RC.status, limit: 300 });
     $('#rcList').innerHTML = '<div class="muted sm mb">' + r.total + ' receipt(s)</div>' + table([
-      { l: 'Receipt', h: x => '<b>' + e(x.receiptNo) + '</b>' + (+x.rev > 1 ? ' <span class="muted sm">rev ' + e(x.rev) + '</span>' : '') }, { l: 'Date', k: 'date' }, { l: 'Student', h: x => e(x.studentName) + ' <span class="muted">#' + e(x.admNo) + '</span>' }, { l: 'Class', k: 'className' }, { l: 'Mode', k: 'mode' }, { l: 'Total', n: 1, f: x => money(x.total) },
+      { l: 'Receipt', h: x => '<b>' + e(x.receiptNo) + '</b>' + (+x.rev > 1 ? ' <span class="muted sm">rev ' + e(x.rev) + '</span>' : '') }, { l: 'Date', k: 'date' }, { l: 'Student', h: x => e(x.studentName) + ' <span class="muted">#' + e(x.admNo) + '</span>' }, { l: 'Class', k: 'className' }, { l: 'Mode', k: 'mode' }, { l: 'Total', n: 1, h: x => money(x.total) + (+x.waivedTotal ? '<div class="muted sm" title="' + e(x.waiveReason) + '">waived ' + money(x.waivedTotal) + '</div>' : '') },
       { l: 'Status', h: x => pill(x.status, x.status === 'ACTIVE' ? 'ok' : 'bad') }, { l: 'Email', h: x => x.emailStatus === 'SENT' ? pill('Sent', 'ok') : x.emailStatus ? '<span title="' + e(x.emailStatus) + '">' + pill('Failed', 'bad') + '</span>' : pill('—') },
-      { l: '', h: x => '<div class="row" style="flex-wrap:nowrap"><button class="btn sm" data-act="viewrc" data-id="' + e(x.receiptNo) + '">View</button>' + (x.pdfUrl ? '<a class="btn sm" target="_blank" rel="noopener noreferrer" href="' + e(x.pdfUrl) + '">PDF</a>' : '') +
+      { l: '', h: x => '<div class="row" style="flex-wrap:nowrap"><button class="btn sm" data-act="viewrc" data-id="' + e(x.receiptNo) + '">View</button>' + (x.pdfFileId ? '<button class="btn sm" data-act="pdfrc" data-id="' + e(x.receiptNo) + '" data-f="' + e(x.pdfFileId) + '">PDF</button>' : '') +
         (x.status === 'ACTIVE' ? '<button class="btn sm" data-act="mailrc" data-id="' + e(x.receiptNo) + '" data-to="' + e(x.emailTo) + '">Email</button>' + (can('fees.edit') ? '<button class="btn sm" data-act="editrc" data-id="' + e(x.receiptNo) + '">Edit</button>' : '') + (can('fees.cancel') ? '<button class="btn sm bad" data-act="cancelrc" data-id="' + e(x.receiptNo) + '">Cancel</button>' : '') : '') + '</div>' }], r.rows, { empty: 'No receipts found.' });
   };
   const dl = debounce(() => run(null, load), 300); $('#rq').oninput = dl; ['rf', 'rt', 'rs'].forEach(i => $('#' + i).onchange = () => run(null, load)); await load();
@@ -391,7 +487,7 @@ VIEWS.adjust = async () => {
     '<div class="card"><h2>2. Details</h2><div class="grid mt" style="gap:12px">' +
     fld('Fee type', '<select id="aft">' + opt(B.feeTypes.filter(f => f.id !== 'ft_opening' || A !== 'extra'), 'id', 'name', '', 'Select') + '</select>') +
     '<div><div class="muted sm mb b">Periods</div><div class="grid" style="gap:6px;max-height:200px;overflow:auto">' + periods.map(p => '<label class="chk"><input type="checkbox" class="ap" value="' + e(p.id) + '"> ' + e(p.name) + '</label>').join('') + '</div></div>' +
-    fld('Amount', inp('aamt', '', 'type="number" min="0" step="0.01"')) + (A === 'cease' ? chk('afull', 'Full outstanding amount (ignore amount above)', false) : '') +
+    fld(A === 'concession' ? 'Amount (or percentage)' : 'Amount', inp('aamt', '', 'type="number" min="0" step="0.01"')) + (A === 'concession' ? chk('apct', 'Treat the amount as a percentage of each student’s due (e.g. 25 = 25% off)', false) : '') + (A === 'cease' ? chk('afull', 'Full outstanding amount (ignore amount above)', false) : '') +
     fld('Date', inp('adate', today(), 'type="date"')) + fld('Remarks', inp('arem', '', 'maxlength="200"')) + '<button class="btn pri" id="aApply" style="justify-content:center;padding:11px">Apply to selected students</button></div></div></div>';
   if (window.innerWidth < 1000) $('#adjGrid').style.gridTemplateColumns = '1fr';
   let rows = [];
@@ -408,7 +504,7 @@ VIEWS.adjust = async () => {
     const adm = $$('.as:checked').map(c => c.value), pids = $$('.ap:checked').map(c => c.value), full = A === 'cease' && v('afull');
     if (!adm.length) throw new Error('Select at least one student.'); if (!v('aft')) throw new Error('Select a fee type.'); if (!pids.length) throw new Error('Select at least one period.'); if (!full && !(parseFloat(v('aamt')) > 0)) throw new Error('Enter an amount.');
     if (!(await ask(info[0] + ': apply to ' + adm.length + ' student(s) for ' + pids.length + ' period(s)?', 'Apply', A === 'refund'))) return;
-    const r = await api('adjust', { kind: info[1], admNos: adm, periodIds: pids, feeTypeId: v('aft'), amount: parseFloat(v('aamt')) || 0, fullAmount: full, date: v('adate'), remarks: v('arem') });
+    const r = await api('adjust', { kind: info[1], admNos: adm, periodIds: pids, feeTypeId: v('aft'), amount: parseFloat(v('aamt')) || 0, pct: A === 'concession' && v('apct'), fullAmount: full, date: v('adate'), remarks: v('arem') });
     toast(r.applied + ' entries posted' + (r.skipped.length ? '; skipped ' + r.skipped.length + ' student(s) (amount exceeds due/paid)' : '') + '.', 'ok');
   });
   await load();
@@ -555,8 +651,8 @@ VIEWS.yearend = async () => {
 };
 
 /* ================= USERS ================= */
-const ROLES = { admin: 'Administrator – everything', accountant: 'Accountant – fees, adjustments, reports, setup', reception: 'Reception – admissions & fee receipts', teacher: 'Teacher – view students & reports' };
-const PERMS = { 'students.view': 'View students', 'students.edit': 'Add/edit students', 'fees.receive': 'Issue receipts', 'fees.edit': 'Edit receipts', 'fees.cancel': 'Cancel receipts', 'fees.adjust': 'Fee adjustments & late fee waiver', 'reports.view': 'View reports', 'masters.edit': 'Edit setup/masters', 'audit.view': 'View audit log', 'users.manage': 'Manage users', 'settings.edit': 'Edit settings' };
+const ROLES = { admin: 'Administrator – everything', accountant: 'Accountant – fees, adjustments, reports, setup', reception: 'Reception – admissions & fee receipts', teacher: 'Teacher – view students & reports', auditor: 'Auditor – read-only view of books, reports and audit log', gatekeeper: 'Gatekeeper – gate pass verification only' };
+const PERMS = { 'students.view': 'View students', 'students.edit': 'Add/edit students', 'fees.receive': 'Issue receipts', 'fees.edit': 'Edit receipts', 'fees.cancel': 'Cancel receipts', 'fees.adjust': 'Fee adjustments', 'fees.waive': 'Waive / subsidise fees at receipt', 'accounts.view': 'View accounts & vouchers', 'accounts.post': 'Post vouchers (receipts/payments)', 'accounts.edit': 'Edit vouchers', 'accounts.cancel': 'Cancel vouchers', 'accounts.manage': 'Manage accounts, lock date, reconciliation', 'gate.issue': 'Issue gate passes', 'gate.verify': 'Verify / exit gate passes', 'reports.view': 'View reports', 'masters.edit': 'Edit setup/masters', 'audit.view': 'View audit log', 'users.manage': 'Manage users', 'settings.edit': 'Edit settings' };
 VIEWS.users = async () => {
   const rows = await api('usersList');
   $('#view').innerHTML = '<div class="card"><div class="row between mb"><h2>Users</h2><button class="btn pri" id="uAdd">+ Add user</button></div>' + table([{ l: 'Username', k: 'username' }, { l: 'Name', k: 'name' }, { l: 'Role', h: u => pill(u.role, 'pri') }, { l: 'Email', k: 'email' }, { l: 'Status', h: u => u.active ? pill('Active', 'ok') : pill('Disabled', 'bad') }, { l: '', h: u => '<button class="btn sm" data-act="uedit" data-id="' + e(u.id) + '">Edit</button>' }], rows) + '</div>';
@@ -603,15 +699,20 @@ VIEWS.audit = async () => {
   $('#auq').oninput = debounce(() => run(null, load), 300); await load();
 };
 
+/* ---- shared toolkit for accounts.js (loaded after this file) ---- */
+const ERP = window.ERP = { S, T, t, $, $$, e, v, fld, inp, chk, opt, pill, spinner, table, modal, ask, askText, toast, run, api, money, cm, today, can, csv, download, debounce, emailOk, byId, VIEWS, NAV, buildNav, go, openFile, capturePhoto, attachBox, loadImg, prepFile, autocomplete, viewReceipt, refreshBoot, acts: {}, cn, sn };
+
 /* ================= global event wiring ================= */
 document.addEventListener('click', ev => {
   const a = ev.target.closest('[data-act]');
   if (a) {
     const id = a.dataset.id, act = a.dataset.act;
+    if (ERP.acts[act]) { ERP.acts[act](a, id); return; }
     if (act === 'collect') go('fees', { admNo: id });
     else if (act === 'ledger') ledgerModal(id);
     else if (act === 'editst') run(null, () => studentForm(id));
     else if (act === 'viewrc') viewReceipt(id);
+    else if (act === 'pdfrc') openFile(a.dataset.f, 'Receipt ' + id);
     else if (act === 'editrc') go('fees', { edit: id });
     else if (act === 'mailrc') askText('Email receipt ' + id, 'Send to', a.dataset.to, true).then(to => { if (to) run(a, async () => { const r = await api('receiptResend', { receiptNo: id, emailTo: to }); toast(r.emailStatus === 'SENT' ? 'Email sent.' : r.emailStatus, r.emailStatus === 'SENT' ? 'ok' : 'bad'); VIEWS.receipts(); }); });
     else if (act === 'cancelrc') askText('Cancel receipt ' + id, 'Reason for cancellation (required)', '', true).then(rs => { if (rs) run(a, async () => { await api('receiptCancel', { receiptNo: id, reason: rs }); toast('Receipt cancelled.', 'ok'); VIEWS.receipts(); }); });
@@ -634,12 +735,13 @@ document.addEventListener('click', ev => {
 });
 document.addEventListener('input', ev => {
   const el = ev.target;
-  if (el.dataset && el.dataset.amt !== undefined && FE && FE.detail) { let x = parseFloat(el.value) || 0; const due = parseFloat(el.dataset.due); if (x > due) { x = due; el.value = due; } FE.amt[el.dataset.amt] = x; updateFeeTotals(); }
+  if (el.dataset && el.dataset.amt !== undefined && FE && FE.detail) { let x = parseFloat(el.value) || 0; const due = parseFloat(el.dataset.due), w = +FE.wv[el.dataset.amt] || 0; if (x + w > due + 0.004) { x = Math.max(0, Math.round((due - w) * 100) / 100); el.value = x || ''; } FE.amt[el.dataset.amt] = x; updateFeeTotals(); }
+  if (el.dataset && el.dataset.wv !== undefined && FE && FE.detail) { let x = parseFloat(el.value) || 0; const due = parseFloat(el.dataset.due), paid = +FE.amt[el.dataset.wv] || 0; if (x + paid > due + 0.004) { x = Math.max(0, Math.round((due - paid) * 100) / 100); el.value = x || ''; } FE.wv[el.dataset.wv] = x; updateFeeTotals(); }
   if (el.id === 'fwaive' && FE) { FE.waive = parseFloat(el.value) || 0; updateFeeTotals(); }
 });
 document.addEventListener('change', ev => {
   const el = ev.target;
-  if (el.dataset && el.dataset.pc !== undefined && FE && FE.detail) { const p = FE.detail.periods.find(x => x.periodId === el.dataset.pc); p.lines.forEach(l => { const k = p.periodId + '|' + l.feeTypeId; FE.amt[k] = el.checked ? l.due : 0; const inpEl = $('[data-amt="' + k + '"]'); if (inpEl) inpEl.value = el.checked ? l.due : ''; }); updateFeeTotals(); }
+  if (el.dataset && el.dataset.pc !== undefined && FE && FE.detail) { const p = FE.detail.periods.find(x => x.periodId === el.dataset.pc); p.lines.forEach(l => { const k = p.periodId + '|' + l.feeTypeId; FE.amt[k] = el.checked ? l.due : 0; FE.wv[k] = 0; const inpEl = $('[data-amt="' + k + '"]'); if (inpEl) inpEl.value = el.checked ? l.due : ''; const wEl = $('[data-wv="' + k + '"]'); if (wEl) wEl.value = ''; }); updateFeeTotals(); }
 });
 
 /* ---------------- boot ---------------- */
